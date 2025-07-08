@@ -76,17 +76,17 @@ class FeedbackLinearizationController(Node):
 
         # Trajectory following
         self.current_wp_idx = 0
-        self.wp_threshold = 0.05
-        self.trajectory = generate_square_waypoints(size=3.0, height=4.0)
+        self.wp_threshold = 0.2  # Increased threshold for easier waypoint switching
+        self.trajectory = generate_square_waypoints(size=2.0, height=3.0)  # Smaller square, lower height
 
-        # Feedback linearization gains
+        # Feedback linearization gains - More conservative values
         # Position control gains (outer loop)
-        self.kp_pos = np.array([5.0, 5.0, 10.0])  # [x, y, z]
-        self.kd_pos = np.array([3.0, 3.0, 6.0])   # [x, y, z]
+        self.kp_pos = np.array([3.0, 3.0, 8.0])  # [x, y, z] - reduced from [5,5,10]
+        self.kd_pos = np.array([2.0, 2.0, 4.0])   # [x, y, z] - reduced from [3,3,6]
         
         # Attitude control gains (inner loop)
-        self.kp_att = np.array([8.0, 8.0, 4.0])   # [roll, pitch, yaw]
-        self.kd_att = np.array([2.0, 2.0, 1.0])   # [roll, pitch, yaw]
+        self.kp_att = np.array([6.0, 6.0, 2.0])   # [roll, pitch, yaw] - reduced from [8,8,4]
+        self.kd_att = np.array([1.5, 1.5, 0.5])   # [roll, pitch, yaw] - reduced from [2,2,1]
 
         # Time tracking
         self.last_time = self.get_clock().now()
@@ -148,9 +148,19 @@ class FeedbackLinearizationController(Node):
             self.velocity_y = (self.current_y - self.previous_y) / self.dt
             self.velocity_z = (self.current_z - self.previous_z) / self.dt
             
-            self.angular_velocity_x = (self.roll - self.previous_roll) / self.dt
-            self.angular_velocity_y = (self.pitch - self.previous_pitch) / self.dt
-            self.angular_velocity_z = (self.yaw - self.previous_yaw) / self.dt
+            # Handle angle wrapping for angular velocity calculation
+            roll_diff = self.roll - self.previous_roll
+            pitch_diff = self.pitch - self.previous_pitch
+            yaw_diff = self.yaw - self.previous_yaw
+            
+            # Wrap angles to [-pi, pi]
+            roll_diff = np.arctan2(np.sin(roll_diff), np.cos(roll_diff))
+            pitch_diff = np.arctan2(np.sin(pitch_diff), np.cos(pitch_diff))
+            yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
+            
+            self.angular_velocity_x = roll_diff / self.dt
+            self.angular_velocity_y = pitch_diff / self.dt
+            self.angular_velocity_z = yaw_diff / self.dt
         
         self.last_time = now
         self.control_loop()
@@ -223,30 +233,56 @@ class FeedbackLinearizationController(Node):
         # Virtual control inputs for position (desired accelerations)
         virtual_control = desired_acceleration + self.kp_pos * position_error + self.kd_pos * velocity_error
         
-        # Desired total thrust (along body z-axis)
-        desired_thrust = self.mass * (virtual_control[2] + self.gravity)
+        # Desired total thrust (in world frame, convert to body frame)
+        # The thrust vector in world frame
+        thrust_world = np.array([0, 0, self.mass * (virtual_control[2] + self.gravity)])
         
-        # Desired attitude angles from virtual control
-        desired_roll = (virtual_control[0] * np.sin(self.yaw) - virtual_control[1] * np.cos(self.yaw)) / self.gravity
-        desired_pitch = (virtual_control[0] * np.cos(self.yaw) + virtual_control[1] * np.sin(self.yaw)) / self.gravity
+        # Rotation matrix from body to world frame
+        cos_roll = np.cos(self.roll)
+        sin_roll = np.sin(self.roll)
+        cos_pitch = np.cos(self.pitch)
+        sin_pitch = np.sin(self.pitch)
+        cos_yaw = np.cos(self.yaw)
+        sin_yaw = np.sin(self.yaw)
+        
+        # Rotation matrix (body to world)
+        R_bw = np.array([
+            [cos_pitch * cos_yaw, sin_roll * sin_pitch * cos_yaw - cos_roll * sin_yaw, cos_roll * sin_pitch * cos_yaw + sin_roll * sin_yaw],
+            [cos_pitch * sin_yaw, sin_roll * sin_pitch * sin_yaw + cos_roll * cos_yaw, cos_roll * sin_pitch * sin_yaw - sin_roll * cos_yaw],
+            [-sin_pitch, sin_roll * cos_pitch, cos_roll * cos_pitch]
+        ])
+        
+        # Desired thrust magnitude
+        desired_thrust = thrust_world[2] / (cos_roll * cos_pitch)
+        
+        # Desired attitude angles from virtual control (corrected equations)
+        desired_roll = np.arcsin(clamp(
+            (virtual_control[0] * np.sin(self.yaw) - virtual_control[1] * np.cos(self.yaw)) / self.gravity,
+            -0.9, 0.9
+        ))
+        desired_pitch = np.arcsin(clamp(
+            (virtual_control[0] * np.cos(self.yaw) + virtual_control[1] * np.sin(self.yaw)) / self.gravity,
+            -0.9, 0.9
+        ))
         desired_yaw = 0.0  # Keep yaw at 0 for simplicity
-        
-        # Clamp desired angles to reasonable limits
-        desired_roll = clamp(desired_roll, -0.5, 0.5)  # ±30 degrees
-        desired_pitch = clamp(desired_pitch, -0.5, 0.5)
         
         # Attitude errors
         desired_attitude = np.array([desired_roll, desired_pitch, desired_yaw])
-        desired_angular_velocity = np.array([0.0, 0.0, 0.0])  # Assuming zero desired angular velocity
+        desired_angular_velocity = np.array([0.0, 0.0, 0.0])
         
         attitude_error = desired_attitude - current_attitude
         angular_velocity_error = desired_angular_velocity - current_angular_velocity
+        
+        # Handle angle wrapping for attitude error
+        attitude_error[0] = np.arctan2(np.sin(attitude_error[0]), np.cos(attitude_error[0]))
+        attitude_error[1] = np.arctan2(np.sin(attitude_error[1]), np.cos(attitude_error[1]))
+        attitude_error[2] = np.arctan2(np.sin(attitude_error[2]), np.cos(attitude_error[2]))
         
         # Virtual control inputs for attitude (desired angular accelerations)
         virtual_torque = self.kp_att * attitude_error + self.kd_att * angular_velocity_error
         
         # Convert virtual inputs to actual control inputs
-        thrust = desired_thrust
+        thrust = max(desired_thrust, 0.1)  # Ensure positive thrust
         tau_x = virtual_torque[0] * self.Ixx
         tau_y = virtual_torque[1] * self.Iyy
         tau_z = virtual_torque[2] * self.Izz
@@ -259,16 +295,24 @@ class FeedbackLinearizationController(Node):
     def control_allocation(self, thrust, tau_x, tau_y, tau_z):
         """
         Convert thrust and torques to individual motor speeds
+        Corrected control allocation for X-configuration quadcopter
         """
-        # Control allocation matrix for X-configuration quadcopter
-        # Motor arrangement:
-        # 0: Front-right, 1: Back-left, 2: Front-left, 3: Back-right
+        # Motor arrangement (X-configuration):
+        # 0: Front-right (+x, +y), 1: Back-left (-x, -y), 2: Front-left (-x, +y), 3: Back-right (+x, -y)
         
-        # Thrust force from each motor
-        f0 = thrust/4 - tau_y/(2*self.arm_length) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
-        f1 = thrust/4 - tau_x/(2*self.arm_length) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
-        f2 = thrust/4 + tau_y/(2*self.arm_length) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
-        f3 = thrust/4 + tau_x/(2*self.arm_length) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        # Distance from center to motor (for X-configuration)
+        L = self.arm_length / np.sqrt(2)  # Distance to motor along x or y axis
+        
+        # Control allocation matrix inversion
+        # For X-configuration: tau_x = L * (f0 - f1 - f2 + f3)
+        #                      tau_y = L * (f0 - f1 + f2 - f3)
+        #                      tau_z = (d/k) * (-f0 + f1 - f2 + f3)
+        
+        # Solve for individual motor forces
+        f0 = thrust/4 + tau_x/(4*L) + tau_y/(4*L) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f1 = thrust/4 - tau_x/(4*L) - tau_y/(4*L) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f2 = thrust/4 - tau_x/(4*L) + tau_y/(4*L) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f3 = thrust/4 + tau_x/(4*L) - tau_y/(4*L) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
         
         # Convert forces to motor speeds (omega = sqrt(F / k_thrust))
         motor_speeds = []
@@ -277,9 +321,10 @@ class FeedbackLinearizationController(Node):
         for force in forces:
             if force > 0:
                 omega = np.sqrt(force / self.thrust_coefficient)
-                motor_speed = clamp(omega, 400.0, 800.0)
+                # Increased motor speed range for better control authority
+                motor_speed = clamp(omega, 100.0, 1500.0)
             else:
-                motor_speed = 400.0  # Minimum motor speed
+                motor_speed = 100.0  # Minimum motor speed
             motor_speeds.append(motor_speed)
         
         return motor_speeds
