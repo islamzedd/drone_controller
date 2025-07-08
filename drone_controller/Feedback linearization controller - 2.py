@@ -146,7 +146,7 @@ class FeedbackLinearizationController(Node):
         self.feedback_linearization_control()
 
     def feedback_linearization_control(self):
-        if self.current_z is None or self.prev_x is None:
+        if self.current_z is None:
             return
         
         # Time step calculation
@@ -155,8 +155,14 @@ class FeedbackLinearizationController(Node):
         if dt <= 0.001:
             return
         
+        # Check for valid current pose values
+        if (np.isnan(self.current_x) or np.isnan(self.current_y) or np.isnan(self.current_z) or
+            np.isnan(self.roll) or np.isnan(self.pitch) or np.isnan(self.yaw)):
+            self.get_logger().warn("NaN in current pose, skipping control iteration")
+            return
+        
         # Estimate velocities using numerical differentiation
-        if self.prev_x is not None:
+        if self.prev_x is not None and not np.isnan(self.prev_x):
             self.vel_x = (self.current_x - self.prev_x) / dt
             self.vel_y = (self.current_y - self.prev_y) / dt
             self.vel_z = (self.current_z - self.prev_z) / dt
@@ -174,6 +180,15 @@ class FeedbackLinearizationController(Node):
             self.omega_x = roll_diff / dt
             self.omega_y = pitch_diff / dt
             self.omega_z = yaw_diff / dt
+            
+            # Check for NaN in angular velocities
+            if np.isnan(self.omega_x) or np.isnan(self.omega_y) or np.isnan(self.omega_z):
+                self.get_logger().warn("NaN in angular velocities, setting to zero")
+                self.omega_x = self.omega_y = self.omega_z = 0.0
+        else:
+            # Initialize velocities to zero on first iteration
+            self.vel_x = self.vel_y = self.vel_z = 0.0
+            self.omega_x = self.omega_y = self.omega_z = 0.0
         
         # Waypoint tracking
         if self.current_wp_idx >= len(self.trajectory):
@@ -247,14 +262,35 @@ class FeedbackLinearizationController(Node):
         e_att = np.array([phi_d - self.roll, theta_d - self.pitch, psi_d - self.yaw])
         e_omega = np.array([0.0 - self.omega_x, 0.0 - self.omega_y, 0.0 - self.omega_z])
         
+        # Check for NaN in attitude errors
+        if np.any(np.isnan(e_att)) or np.any(np.isnan(e_omega)):
+            self.get_logger().warn(f"NaN in attitude errors: e_att={e_att}, e_omega={e_omega}")
+            self.get_logger().warn(f"phi_d={phi_d}, theta_d={theta_d}, roll={self.roll}, pitch={self.pitch}")
+            self.get_logger().warn(f"omega_x={self.omega_x}, omega_y={self.omega_y}, omega_z={self.omega_z}")
+            return
+        
         # Desired angular accelerations from attitude control
         alpha_d = self.kp_att * e_att + self.kd_att * e_omega
         
+        # Check for NaN in desired angular accelerations
+        if np.any(np.isnan(alpha_d)):
+            self.get_logger().warn(f"NaN in alpha_d: {alpha_d}")
+            self.get_logger().warn(f"e_att={e_att}, e_omega={e_omega}")
+            self.get_logger().warn(f"kp_att={self.kp_att}, kd_att={self.kd_att}")
+            return
+        
         # Feedback linearization for attitude control
-        # Calculate control moments u1, u2, u3
+        # Calculate control moments u1, u2, u3 with safety checks
         u1 = self.Ixx * alpha_d[0] + (self.Iyy - self.Izz) * self.omega_y * self.omega_z
         u2 = self.Iyy * alpha_d[1] + (self.Izz - self.Ixx) * self.omega_z * self.omega_x
         u3 = self.Izz * alpha_d[2] + (self.Ixx - self.Iyy) * self.omega_x * self.omega_y
+        
+        # Check for NaN in control moments
+        if np.isnan(u1) or np.isnan(u2) or np.isnan(u3):
+            self.get_logger().warn(f"NaN in control moments: u1={u1}, u2={u2}, u3={u3}")
+            self.get_logger().warn(f"alpha_d={alpha_d}")
+            self.get_logger().warn(f"omega_x={self.omega_x}, omega_y={self.omega_y}, omega_z={self.omega_z}")
+            return
         
         # Convert control inputs to motor speeds
         # Motor mixing (X configuration)
