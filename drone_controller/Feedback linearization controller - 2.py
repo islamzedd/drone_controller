@@ -79,14 +79,14 @@ class FeedbackLinearizationController(Node):
         self.wp_threshold = 0.05
         self.trajectory = generate_square_waypoints(size=3.0, height=4.0)
 
-        # Feedback linearization gains
+        # Feedback linearization gains (reduced for stability)
         # Position control gains (outer loop)
-        self.kp_pos = np.array([5.0, 5.0, 10.0])  # [x, y, z]
-        self.kd_pos = np.array([3.0, 3.0, 6.0])   # [x, y, z]
+        self.kp_pos = np.array([2.0, 2.0, 5.0])  # [x, y, z]
+        self.kd_pos = np.array([1.5, 1.5, 3.0])   # [x, y, z]
         
         # Attitude control gains (inner loop)
-        self.kp_att = np.array([8.0, 8.0, 4.0])   # [roll, pitch, yaw]
-        self.kd_att = np.array([2.0, 2.0, 1.0])   # [roll, pitch, yaw]
+        self.kp_att = np.array([4.0, 4.0, 2.0])   # [roll, pitch, yaw]
+        self.kd_att = np.array([1.0, 1.0, 0.5])   # [roll, pitch, yaw]
 
         # Time tracking
         self.last_time = self.get_clock().now()
@@ -142,15 +142,26 @@ class FeedbackLinearizationController(Node):
         if self.dt <= 0.001:
             return
         
-        # Calculate velocities (numerical differentiation)
+        # Calculate velocities (numerical differentiation with filtering)
         if self.previous_x is not None:
-            self.velocity_x = (self.current_x - self.previous_x) / self.dt
-            self.velocity_y = (self.current_y - self.previous_y) / self.dt
-            self.velocity_z = (self.current_z - self.previous_z) / self.dt
+            # Simple low-pass filter for velocity estimation
+            alpha = 0.3  # Filter coefficient
+            raw_vx = (self.current_x - self.previous_x) / self.dt
+            raw_vy = (self.current_y - self.previous_y) / self.dt
+            raw_vz = (self.current_z - self.previous_z) / self.dt
             
-            self.angular_velocity_x = (self.roll - self.previous_roll) / self.dt
-            self.angular_velocity_y = (self.pitch - self.previous_pitch) / self.dt
-            self.angular_velocity_z = (self.yaw - self.previous_yaw) / self.dt
+            self.velocity_x = alpha * raw_vx + (1 - alpha) * self.velocity_x
+            self.velocity_y = alpha * raw_vy + (1 - alpha) * self.velocity_y
+            self.velocity_z = alpha * raw_vz + (1 - alpha) * self.velocity_z
+            
+            # Angular velocities with filtering
+            raw_wx = (self.roll - self.previous_roll) / self.dt
+            raw_wy = (self.pitch - self.previous_pitch) / self.dt
+            raw_wz = (self.yaw - self.previous_yaw) / self.dt
+            
+            self.angular_velocity_x = alpha * raw_wx + (1 - alpha) * self.angular_velocity_x
+            self.angular_velocity_y = alpha * raw_wy + (1 - alpha) * self.angular_velocity_y
+            self.angular_velocity_z = alpha * raw_wz + (1 - alpha) * self.angular_velocity_z
         
         self.last_time = now
         self.control_loop()
@@ -223,17 +234,29 @@ class FeedbackLinearizationController(Node):
         # Virtual control inputs for position (desired accelerations)
         virtual_control = desired_acceleration + self.kp_pos * position_error + self.kd_pos * velocity_error
         
-        # Desired total thrust (along body z-axis)
-        desired_thrust = self.mass * (virtual_control[2] + self.gravity)
+        # Desired total thrust (along body z-axis) - corrected formulation
+        # Add gravity compensation and limit thrust command
+        thrust_command = virtual_control[2] + self.gravity
+        desired_thrust = self.mass * thrust_command
         
-        # Desired attitude angles from virtual control
-        desired_roll = (virtual_control[0] * np.sin(self.yaw) - virtual_control[1] * np.cos(self.yaw)) / self.gravity
-        desired_pitch = (virtual_control[0] * np.cos(self.yaw) + virtual_control[1] * np.sin(self.yaw)) / self.gravity
+        # Limit thrust to reasonable bounds
+        max_thrust = 4 * self.thrust_coefficient * (750.0**2)  # 4 motors at 750 rad/s
+        min_thrust = 4 * self.thrust_coefficient * (450.0**2)  # 4 motors at 450 rad/s
+        desired_thrust = clamp(desired_thrust, min_thrust, max_thrust)
+        
+        # Desired attitude angles from virtual control (corrected signs)
+        if abs(thrust_command) > 0.1:  # Avoid division by very small numbers
+            desired_roll = -(virtual_control[1] * np.cos(self.yaw) - virtual_control[0] * np.sin(self.yaw)) / thrust_command
+            desired_pitch = (virtual_control[0] * np.cos(self.yaw) + virtual_control[1] * np.sin(self.yaw)) / thrust_command
+        else:
+            desired_roll = 0.0
+            desired_pitch = 0.0
+        
         desired_yaw = 0.0  # Keep yaw at 0 for simplicity
         
-        # Clamp desired angles to reasonable limits
-        desired_roll = clamp(desired_roll, -0.5, 0.5)  # ±30 degrees
-        desired_pitch = clamp(desired_pitch, -0.5, 0.5)
+        # Clamp desired angles to reasonable limits (±20 degrees)
+        desired_roll = clamp(desired_roll, -0.35, 0.35)
+        desired_pitch = clamp(desired_pitch, -0.35, 0.35)
         
         # Attitude errors
         desired_attitude = np.array([desired_roll, desired_pitch, desired_yaw])
@@ -259,16 +282,21 @@ class FeedbackLinearizationController(Node):
     def control_allocation(self, thrust, tau_x, tau_y, tau_z):
         """
         Convert thrust and torques to individual motor speeds
+        Improved control allocation for X-configuration quadcopter
         """
         # Control allocation matrix for X-configuration quadcopter
-        # Motor arrangement:
+        # Motor arrangement (standard X-config):
         # 0: Front-right, 1: Back-left, 2: Front-left, 3: Back-right
         
+        # Mixer matrix for X-configuration
+        # Each motor contributes to thrust and torques
+        l = self.arm_length / np.sqrt(2)  # Effective arm length for X-config
+        
         # Thrust force from each motor
-        f0 = thrust/4 - tau_y/(2*self.arm_length) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
-        f1 = thrust/4 - tau_x/(2*self.arm_length) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
-        f2 = thrust/4 + tau_y/(2*self.arm_length) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
-        f3 = thrust/4 + tau_x/(2*self.arm_length) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f0 = thrust/4 - tau_x/(4*l) - tau_y/(4*l) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f1 = thrust/4 + tau_x/(4*l) + tau_y/(4*l) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f2 = thrust/4 + tau_x/(4*l) - tau_y/(4*l) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        f3 = thrust/4 - tau_x/(4*l) + tau_y/(4*l) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
         
         # Convert forces to motor speeds (omega = sqrt(F / k_thrust))
         motor_speeds = []
@@ -276,7 +304,7 @@ class FeedbackLinearizationController(Node):
         
         for force in forces:
             if force > 0:
-                omega = np.sqrt(force / self.thrust_coefficient)
+                omega = np.sqrt(abs(force) / self.thrust_coefficient)
                 motor_speed = clamp(omega, 400.0, 800.0)
             else:
                 motor_speed = 400.0  # Minimum motor speed
@@ -291,74 +319,6 @@ def main(args=None):
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
-[INFO] [1751980518.958211222] [Feedback_Linearization_Controller]: Pos: [-0.00, 0.00, 1.31] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980518.975521370] [Feedback_Linearization_Controller]: Pos: [-0.00, 0.00, 1.36] | Desired: [1.50, 1.50, 4.00] | Motors: [797, 800, 800, 797]
-[INFO] [1751980518.987485331] [Feedback_Linearization_Controller]: Pos: [-0.00, 0.00, 1.42] | Desired: [1.50, 1.50, 4.00] | Motors: [684, 713, 713, 684]
-[INFO] [1751980519.004033391] [Feedback_Linearization_Controller]: Pos: [0.00, -0.00, 1.48] | Desired: [1.50, 1.50, 4.00] | Motors: [715, 743, 743, 715]
-[INFO] [1751980519.019506509] [Feedback_Linearization_Controller]: Pos: [0.00, -0.00, 1.54] | Desired: [1.50, 1.50, 4.00] | Motors: [652, 684, 683, 652]
-[INFO] [1751980519.036416063] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.60] | Desired: [1.50, 1.50, 4.00] | Motors: [649, 681, 680, 648]
-[INFO] [1751980519.053545971] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.67] | Desired: [1.50, 1.50, 4.00] | Motors: [636, 669, 668, 635]
-[INFO] [1751980519.070615859] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.73] | Desired: [1.50, 1.50, 4.00] | Motors: [611, 646, 643, 608]
-[INFO] [1751980519.090484177] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.79] | Desired: [1.50, 1.50, 4.00] | Motors: [638, 672, 670, 636]
-[INFO] [1751980519.106932704] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.86] | Desired: [1.50, 1.50, 4.00] | Motors: [563, 602, 598, 559]
-[INFO] [1751980519.125485425] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.92] | Desired: [1.50, 1.50, 4.00] | Motors: [592, 630, 626, 587]
-[INFO] [1751980519.141491360] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 1.98] | Desired: [1.50, 1.50, 4.00] | Motors: [510, 555, 549, 503]
-[INFO] [1751980519.159406688] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 2.04] | Desired: [1.50, 1.50, 4.00] | Motors: [541, 585, 578, 534]
-[INFO] [1751980519.175713340] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 2.10] | Desired: [1.50, 1.50, 4.00] | Motors: [493, 542, 533, 483]
-[INFO] [1751980519.192820071] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 2.17] | Desired: [1.50, 1.50, 4.00] | Motors: [492, 542, 533, 481]
-[INFO] [1751980519.209773301] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 2.23] | Desired: [1.50, 1.50, 4.00] | Motors: [473, 526, 514, 459]
-[INFO] [1751980519.227000045] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 2.28] | Desired: [1.50, 1.50, 4.00] | Motors: [478, 532, 519, 463]
-[INFO] [1751980519.243184758] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.00, 2.34] | Desired: [1.50, 1.50, 4.00] | Motors: [440, 500, 485, 422]
-[INFO] [1751980519.260181220] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.01, 2.40] | Desired: [1.50, 1.50, 4.00] | Motors: [453, 513, 496, 434]
-[INFO] [1751980519.277029667] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.01, 2.45] | Desired: [1.50, 1.50, 4.00] | Motors: [445, 508, 489, 424]
-[INFO] [1751980519.294116475] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.01, 2.51] | Desired: [1.50, 1.50, 4.00] | Motors: [451, 515, 495, 427]
-[INFO] [1751980519.311458370] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.01, 2.56] | Desired: [1.50, 1.50, 4.00] | Motors: [460, 525, 503, 435]
-[INFO] [1751980519.328559160] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.01, 2.61] | Desired: [1.50, 1.50, 4.00] | Motors: [444, 513, 488, 415]
-[INFO] [1751980519.346155234] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.02, 2.66] | Desired: [1.50, 1.50, 4.00] | Motors: [458, 527, 501, 428]
-[INFO] [1751980519.369382111] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.02, 2.71] | Desired: [1.50, 1.50, 4.00] | Motors: [512, 575, 551, 484]
-[INFO] [1751980519.386466784] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.02, 2.75] | Desired: [1.50, 1.50, 4.00] | Motors: [512, 577, 551, 482]
-[INFO] [1751980519.398116178] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.03, 2.79] | Desired: [1.50, 1.50, 4.00] | Motors: [438, 517, 483, 400]
-[INFO] [1751980519.414172764] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.03, 2.84] | Desired: [1.50, 1.50, 4.00] | Motors: [426, 510, 472, 400]
-[INFO] [1751980519.430961210] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.04, 2.88] | Desired: [1.50, 1.50, 4.00] | Motors: [444, 527, 488, 400]
-[INFO] [1751980519.448000322] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.04, 2.92] | Desired: [1.50, 1.50, 4.00] | Motors: [451, 535, 494, 401]
-[INFO] [1751980519.465227925] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.05, 2.96] | Desired: [1.50, 1.50, 4.00] | Motors: [459, 545, 502, 407]
-[INFO] [1751980519.482362232] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.05, 3.00] | Desired: [1.50, 1.50, 4.00] | Motors: [463, 551, 505, 407]
-[INFO] [1751980519.499973891] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.06, 3.04] | Desired: [1.50, 1.50, 4.00] | Motors: [486, 573, 527, 430]
-[INFO] [1751980519.516787235] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.07, 3.07] | Desired: [1.50, 1.50, 4.00] | Motors: [473, 566, 515, 410]
-[INFO] [1751980519.540588863] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.08, 3.11] | Desired: [1.50, 1.50, 4.00] | Motors: [567, 645, 602, 518]
-[INFO] [1751980519.557299491] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.09, 3.13] | Desired: [1.50, 1.50, 4.00] | Motors: [559, 640, 594, 504]
-[INFO] [1751980519.570894875] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.10, 3.16] | Desired: [1.50, 1.50, 4.00] | Motors: [470, 575, 512, 400]
-[INFO] [1751980519.587714953] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.11, 3.19] | Desired: [1.50, 1.50, 4.00] | Motors: [512, 610, 550, 439]
-[INFO] [1751980519.604238946] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.13, 3.22] | Desired: [1.50, 1.50, 4.00] | Motors: [533, 631, 570, 460]
-[INFO] [1751980519.621484828] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.14, 3.25] | Desired: [1.50, 1.50, 4.00] | Motors: [541, 641, 577, 464]
-[INFO] [1751980519.637476551] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.16, 3.27] | Desired: [1.50, 1.50, 4.00] | Motors: [531, 638, 568, 444]
-[INFO] [1751980519.653523839] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.18, 3.30] | Desired: [1.50, 1.50, 4.00] | Motors: [547, 655, 583, 458]
-[INFO] [1751980519.670560958] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.20, 3.32] | Desired: [1.50, 1.50, 4.00] | Motors: [571, 678, 605, 482]
-[INFO] [1751980519.687606379] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.23, 3.34] | Desired: [1.50, 1.50, 4.00] | Motors: [590, 698, 623, 500]
-[INFO] [1751980519.704445747] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.25, 3.35] | Desired: [1.50, 1.50, 4.00] | Motors: [608, 717, 640, 514]
-[INFO] [1751980519.721277492] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.28, 3.37] | Desired: [1.50, 1.50, 4.00] | Motors: [628, 738, 659, 532]
-[INFO] [1751980519.738625541] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.31, 3.38] | Desired: [1.50, 1.50, 4.00] | Motors: [652, 762, 682, 556]
-[INFO] [1751980519.756079882] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.34, 3.39] | Desired: [1.50, 1.50, 4.00] | Motors: [677, 787, 705, 579]
-[INFO] [1751980519.773671324] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.38, 3.40] | Desired: [1.50, 1.50, 4.00] | Motors: [703, 800, 730, 604]
-[INFO] [1751980519.790763184] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.41, 3.40] | Desired: [1.50, 1.50, 4.00] | Motors: [732, 800, 758, 631]
-[INFO] [1751980519.807657627] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.46, 3.40] | Desired: [1.50, 1.50, 4.00] | Motors: [764, 800, 789, 663]
-[INFO] [1751980519.824459555] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.50, 3.40] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 699]
-[INFO] [1751980519.841112852] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.55, 3.39] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 738]
-[INFO] [1751980519.857819175] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.60, 3.37] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 780]
-[INFO] [1751980519.875311261] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.65, 3.36] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.892663052] [Feedback_Linearization_Controller]: Pos: [-0.00, -0.71, 3.33] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.915016851] [Feedback_Linearization_Controller]: Pos: [-0.01, -0.77, 3.30] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.928306773] [Feedback_Linearization_Controller]: Pos: [-0.01, -0.83, 3.27] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.945307342] [Feedback_Linearization_Controller]: Pos: [-0.01, -0.89, 3.22] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.962379726] [Feedback_Linearization_Controller]: Pos: [-0.01, -0.96, 3.17] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.979097282] [Feedback_Linearization_Controller]: Pos: [-0.01, -1.02, 3.11] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980519.996262244] [Feedback_Linearization_Controller]: Pos: [-0.01, -1.09, 3.05] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 400, 800, 800]
-[INFO] [1751980520.013352409] [Feedback_Linearization_Controller]: Pos: [-0.01, -1.15, 2.98] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980520.030976440] [Feedback_Linearization_Controller]: Pos: [-0.02, -1.22, 2.90] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980520.047370146] [Feedback_Linearization_Controller]: Pos: [-0.02, -1.28, 2.82] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-[INFO] [1751980520.064479454] [Feedback_Linearization_Controller]: Pos: [-0.02, -1.34, 2.73] | Desired: [1.50, 1.50, 4.00] | Motors: [800, 800, 800, 800]
-
 
 
 if __name__ == '__main__':
