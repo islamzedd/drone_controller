@@ -18,6 +18,10 @@ def quaternion_to_euler_scipy(w, x, y, z):
 def clamp(val, min_val, max_val):
     return max(min(val, max_val), min_val)
 
+def safe_arcsin(x):
+    """Safely compute arcsin, clamping input to valid range"""
+    return np.arcsin(clamp(x, -1.0, 1.0))
+
 def generate_square_waypoints(size=2.0, height=2.0):
     """
     Generate waypoints for a square trajectory centered at (0,0) at a fixed height.
@@ -157,9 +161,19 @@ class FeedbackLinearizationController(Node):
             self.vel_y = (self.current_y - self.prev_y) / dt
             self.vel_z = (self.current_z - self.prev_z) / dt
             
-            self.omega_x = (self.roll - self.prev_roll) / dt
-            self.omega_y = (self.pitch - self.prev_pitch) / dt
-            self.omega_z = (self.yaw - self.prev_yaw) / dt
+            # Handle angle wraparound for angular velocities
+            roll_diff = self.roll - self.prev_roll
+            pitch_diff = self.pitch - self.prev_pitch
+            yaw_diff = self.yaw - self.prev_yaw
+            
+            # Wrap angle differences to [-π, π]
+            roll_diff = np.arctan2(np.sin(roll_diff), np.cos(roll_diff))
+            pitch_diff = np.arctan2(np.sin(pitch_diff), np.cos(pitch_diff))
+            yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
+            
+            self.omega_x = roll_diff / dt
+            self.omega_y = pitch_diff / dt
+            self.omega_z = yaw_diff / dt
         
         # Waypoint tracking
         if self.current_wp_idx >= len(self.trajectory):
@@ -197,20 +211,34 @@ class FeedbackLinearizationController(Node):
         a_d = self.kp_pos * e_pos + self.kd_pos * e_vel
         
         # Feedback linearization for position control
-        # From the dynamics: ẍ = (u0/m) * (sin(φ)sin(ψ) + cos(φ)cos(ψ)sin(θ))
-        #                    ÿ = (u0/m) * (cos(φ)sin(ψ) - cos(ψ)sin(φ)sin(θ))
-        #                    z̈ = -g + (u0/m) * cos(φ)cos(θ)
+        # Calculate desired thrust u0 with safety checks
+        cos_roll = np.cos(self.roll)
+        cos_pitch = np.cos(self.pitch)
+        cos_product = cos_roll * cos_pitch
         
-        # Calculate desired thrust u0
-        u0_desired = self.m * (a_d[2] + self.g) / (np.cos(self.roll) * np.cos(self.pitch))
+        # Avoid division by zero
+        if abs(cos_product) < 0.1:  # Prevent near-zero division
+            cos_product = 0.1 * np.sign(cos_product) if cos_product != 0 else 0.1
+        
+        u0_desired = self.m * (a_d[2] + self.g) / cos_product
         u0_desired = clamp(u0_desired, 0.1, 20.0)  # Limit thrust
         
-        # Calculate desired roll and pitch angles
-        # From the x and y dynamics, we can derive:
-        phi_d = np.arcsin(self.m * (a_d[0] * np.sin(self.yaw) - a_d[1] * np.cos(self.yaw)) / u0_desired)
-        theta_d = np.arcsin(self.m * (a_d[0] * np.cos(self.yaw) + a_d[1] * np.sin(self.yaw)) / (u0_desired * np.cos(phi_d)))
+        # Calculate desired roll and pitch angles with safety checks
+        sin_yaw = np.sin(self.yaw)
+        cos_yaw = np.cos(self.yaw)
         
-        # Clamp desired angles
+        # Calculate arguments for arcsin and clamp them
+        phi_arg = self.m * (a_d[0] * sin_yaw - a_d[1] * cos_yaw) / u0_desired
+        phi_d = safe_arcsin(phi_arg)
+        
+        cos_phi_d = np.cos(phi_d)
+        if abs(cos_phi_d) < 0.1:  # Prevent near-zero division
+            cos_phi_d = 0.1 * np.sign(cos_phi_d) if cos_phi_d != 0 else 0.1
+        
+        theta_arg = self.m * (a_d[0] * cos_yaw + a_d[1] * sin_yaw) / (u0_desired * cos_phi_d)
+        theta_d = safe_arcsin(theta_arg)
+        
+        # Clamp desired angles to reasonable limits
         phi_d = clamp(phi_d, -0.3, 0.3)      # ±17 degrees
         theta_d = clamp(theta_d, -0.3, 0.3)   # ±17 degrees
         psi_d = 0.0  # Desired yaw (can be modified for trajectory tracking)
@@ -229,9 +257,6 @@ class FeedbackLinearizationController(Node):
         u3 = self.Izz * alpha_d[2] + (self.Ixx - self.Iyy) * self.omega_x * self.omega_y
         
         # Convert control inputs to motor speeds
-        # Based on the mixing matrix for quadcopter configuration
-        # u0 = thrust, u1 = roll moment, u2 = pitch moment, u3 = yaw moment
-        
         # Motor mixing (X configuration)
         motor_thrust = u0_desired / 4.0  # Base thrust per motor
         
@@ -247,19 +272,30 @@ class FeedbackLinearizationController(Node):
         motor3_thrust = motor_thrust - roll_comp + pitch_comp - yaw_comp
         
         # Convert thrust to motor speeds (approximate relationship)
-        # Thrust = k_t * omega^2, so omega = sqrt(Thrust / k_t)
+        # Ensure positive thrust values before square root
         k_t = 0.001  # Thrust coefficient (adjust based on motor/propeller)
         
-        motor0_speed = np.sqrt(abs(motor0_thrust) / k_t) * np.sign(motor0_thrust)
-        motor1_speed = np.sqrt(abs(motor1_thrust) / k_t) * np.sign(motor1_thrust)
-        motor2_speed = np.sqrt(abs(motor2_thrust) / k_t) * np.sign(motor2_thrust)
-        motor3_speed = np.sqrt(abs(motor3_thrust) / k_t) * np.sign(motor3_thrust)
+        # Clamp thrusts to positive values
+        motor0_thrust = max(motor0_thrust, 0.001)
+        motor1_thrust = max(motor1_thrust, 0.001)
+        motor2_thrust = max(motor2_thrust, 0.001)
+        motor3_thrust = max(motor3_thrust, 0.001)
+        
+        motor0_speed = np.sqrt(motor0_thrust / k_t)
+        motor1_speed = np.sqrt(motor1_thrust / k_t)
+        motor2_speed = np.sqrt(motor2_thrust / k_t)
+        motor3_speed = np.sqrt(motor3_thrust / k_t)
         
         # Convert to the expected range and clamp
         motor0 = clamp(motor0_speed + 636.0, 400.0, 800.0)
         motor1 = clamp(motor1_speed + 636.0, 400.0, 800.0)
         motor2 = clamp(motor2_speed + 636.0, 400.0, 800.0)
         motor3 = clamp(motor3_speed + 636.0, 400.0, 800.0)
+        
+        # Final safety check for NaN values
+        if np.isnan(motor0) or np.isnan(motor1) or np.isnan(motor2) or np.isnan(motor3):
+            self.get_logger().warn("NaN detected in motor commands, using safe defaults")
+            motor0 = motor1 = motor2 = motor3 = 636.0
         
         # Publish motor commands
         cmd = Actuators()
