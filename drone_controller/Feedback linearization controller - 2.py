@@ -2,7 +2,7 @@
 import rclpy
 from rclpy.node import Node
 # ROS msg Libs
-from geometry_msgs.msg import PoseArray, PointStamped
+from geometry_msgs.msg import PoseArray, PointStamped, TwistStamped
 from actuator_msgs.msg import Actuators
 from std_msgs.msg import Header
 
@@ -13,22 +13,36 @@ from scipy.spatial.transform import Rotation as R
 def quaternion_to_euler_scipy(w, x, y, z):
     # Reorder to [x, y, z, w] for scipy
     r = R.from_quat([x, y, z, w])
-    return r.as_euler('xyz', degrees=True)  # Roll, pitch, yaw in degree
+    return r.as_euler('xyz', degrees=True)  # Roll, pitch, yaw in degrees
+
+def euler_to_rotation_matrix(roll, pitch, yaw):
+    """Convert euler angles to rotation matrix"""
+    # Convert to radians
+    roll_rad = np.radians(roll)
+    pitch_rad = np.radians(pitch)
+    yaw_rad = np.radians(yaw)
+    
+    # Rotation matrices
+    R_x = np.array([[1, 0, 0],
+                    [0, np.cos(roll_rad), -np.sin(roll_rad)],
+                    [0, np.sin(roll_rad), np.cos(roll_rad)]])
+    
+    R_y = np.array([[np.cos(pitch_rad), 0, np.sin(pitch_rad)],
+                    [0, 1, 0],
+                    [-np.sin(pitch_rad), 0, np.cos(pitch_rad)]])
+    
+    R_z = np.array([[np.cos(yaw_rad), -np.sin(yaw_rad), 0],
+                    [np.sin(yaw_rad), np.cos(yaw_rad), 0],
+                    [0, 0, 1]])
+    
+    return R_z @ R_y @ R_x
 
 def clamp(val, min_val, max_val):
     return max(min(val, max_val), min_val)
 
-
 def generate_square_waypoints(size=2.0, height=2.0):
     """
     Generate waypoints for a square trajectory centered at (0,0) at a fixed height.
-
-    Args:
-        size (float): length of one side of the square (meters)
-        height (float): z-coordinate (altitude) for all waypoints
-
-    Returns:
-        list of [x, y, z] waypoints forming a square loop
     """
     half = size / 2.0
     waypoints = [
@@ -40,105 +54,59 @@ def generate_square_waypoints(size=2.0, height=2.0):
     ]
     return waypoints
 
-def generate_figure_eight_waypoints(num_points=7, A=2.0, B=2.0, H=2.0):
-    waypoints = []
-    t_vals = np.linspace(0, 2 * np.pi, num_points)
-    for t in t_vals:
-        x = A * np.sin(t)
-        y = B * np.sin(t) * np.cos(t)
-        z = H
-        waypoints.append([x, y, z])
-    return waypoints
-
-
-def generate_cool_acrobatic_waypoints(
-    num_points=300, 
-    duration=15.0, 
-    offset=(5, 5, 3),
-    speed=1.0,
-    amp_x1=4.0, amp_x2=2.0,
-    amp_y1=3.0, amp_y2=1.5,
-    amp_z1=1.8, amp_z2=0.5,
-):
-    waypoints = []
-    t_vals = np.linspace(0, duration, num_points)
-    x_off, y_off, z_off = offset
-
-    for t in t_vals:
-        t_fast = speed * t  # scale time for faster/slower trajectory
-
-        # Twisting figure-8 style on x-y with amplitude parameters
-        x = amp_x1 * np.sin(2 * np.pi * 0.3 * t_fast) - amp_x2 * np.sin(2 * np.pi * 0.6 * t_fast)
-        y = amp_y1 * np.cos(2 * np.pi * 0.3 * t_fast) - amp_y2 * np.cos(2 * np.pi * 0.6 * t_fast)
-
-        # Vertical oscillation with amplitude parameters
-        z = 2 + amp_z1 * np.sin(2 * np.pi * 0.5 * t_fast) + amp_z2 * np.sin(2 * np.pi * 1.2 * t_fast)
-
-        # Add offsets
-        x += x_off
-        y += y_off
-        z += z_off
-
-        waypoints.append([x, y, z])
-
-    return waypoints
-
-class PositionController(Node):
+class FeedbackLinearizationController(Node):
     def __init__(self):
-        super().__init__('Position_Controller')
-
-        # Drone physical parameters
-        self.m = 1.5  # Mass in kg
-        self.g = 9.81  # Gravity in m/s^2
+        super().__init__('Feedback_Linearization_Controller')
+        
+        # Quadcopter physical parameters
+        self.mass = 1.5  # kg
+        self.gravity = 9.81  # m/s^2
+        self.Ixx = 0.029  # kg*m^2
+        self.Iyy = 0.029  # kg*m^2
+        self.Izz = 0.055  # kg*m^2
+        self.arm_length = 0.23  # m
+        self.thrust_coefficient = 8.54e-6  # N*s^2/rad^2
+        self.drag_coefficient = 0.016  # N*m*s^2/rad^2
         
         # State variables
         self.position = np.zeros(3)  # [x, y, z]
         self.velocity = np.zeros(3)  # [vx, vy, vz]
-        self.prev_position = np.zeros(3)
-        self.prev_velocity = np.zeros(3)
+        self.euler_angles = np.zeros(3)  # [roll, pitch, yaw] in degrees
+        self.angular_velocity = np.zeros(3)  # [p, q, r] in rad/s
         
-        # Orientation variables
-        self.roll = 0.0
-        self.pitch = 0.0
-        self.yaw = 0.0
+        # Control gains for outer loop (position control)
+        self.kp_pos = np.array([8.0, 8.0, 10.0])  # Position gains
+        self.kd_pos = np.array([4.0, 4.0, 6.0])   # Velocity gains
         
-        # Tracking variables
+        # Control gains for inner loop (attitude control)
+        self.kp_att = np.array([6.0, 6.0, 4.0])   # Attitude gains
+        self.kd_att = np.array([2.0, 2.0, 1.0])   # Angular velocity gains
+        
+        # Trajectory following
+        self.trajectory = generate_square_waypoints(size=4.0, height=3.0)
         self.current_wp_idx = 0
-        self.wp_threshold = 0.05
+        self.wp_threshold = 0.3
         
-        # Control gains for feedback linearization
-        self.kp = np.array([8.0, 8.0, 10.0])  # Position gains
-        self.kd = np.array([4.0, 4.0, 6.0])   # Velocity gains
-        
-        # Attitude control gains
-        self.kp_att = np.array([2.0, 2.0])    # Roll, pitch gains
-        self.kd_att = np.array([0.5, 0.5])    # Roll, pitch derivative gains
-        
-        # Integral terms for attitude control
-        self.integral_roll = 0.0
-        self.integral_pitch = 0.0
-        self.last_error_roll = 0.0
-        self.last_error_pitch = 0.0
+        # Desired trajectory derivatives (for feedforward)
+        self.desired_position = np.zeros(3)
+        self.desired_velocity = np.zeros(3)
+        self.desired_acceleration = np.zeros(3)
         
         # Time management
         self.last_time = self.get_clock().now()
-        self.first_callback = True
-
-        # Trajectory generation
-        traj_type = "default"  # "default", "figure8", "acrobatic"
-
-        if traj_type == "default":
-            self.trajectory = generate_square_waypoints(size=3.0, height=4.0)
-        elif traj_type == "figure8":
-            self.trajectory = generate_figure_eight_waypoints(num_points=20, A=3.0, B=2.0, H=5.0)
-        elif traj_type == "acrobatic":
-            self.trajectory = generate_cool_acrobatic_waypoints(num_points=200, duration=20)
-
+        self.dt = 0.01  # Expected control loop time
+        
         # ROS subscribers and publishers
         self.subscription = self.create_subscription(
             PoseArray,
             '/world/quadcopter/pose/info',
             self.pose_callback,
+            10)
+        
+        self.velocity_subscription = self.create_subscription(
+            TwistStamped,
+            '/world/quadcopter/velocity/info',
+            self.velocity_callback,
             10)
         
         self.publisher_ = self.create_publisher(
@@ -153,142 +121,204 @@ class PositionController(Node):
             self.get_logger().warn("PoseArray has fewer than 2 poses")
             return
         
-        # Update position
-        self.prev_position = self.position.copy()
+        # Extract position and orientation
         self.position[0] = msg.poses[1].position.x
         self.position[1] = msg.poses[1].position.y
         self.position[2] = msg.poses[1].position.z
         
-        # Update orientation
-        self.roll, self.pitch, self.yaw = quaternion_to_euler_scipy(
+        roll, pitch, yaw = quaternion_to_euler_scipy(
             msg.poses[1].orientation.w,
             msg.poses[1].orientation.x,
             msg.poses[1].orientation.y,
             msg.poses[1].orientation.z
         )
-        
-        # Convert degrees to radians for calculations
-        self.roll_rad = np.radians(self.roll)
-        self.pitch_rad = np.radians(self.pitch)
-        self.yaw_rad = np.radians(self.yaw)
+        self.euler_angles = np.array([roll, pitch, yaw])
         
         self.control_loop()
 
-    def control_loop(self):
-        if self.first_callback:
-            self.first_callback = False
-            return
-
-        # Time calculation
-        now = self.get_clock().now()
-        dt = (now - self.last_time).nanoseconds / 1e9
-        if dt <= 0.001:
-            return
-
-        # Calculate velocity using finite difference
-        self.prev_velocity = self.velocity.copy()
-        self.velocity = (self.position - self.prev_position) / dt
+    def velocity_callback(self, msg: TwistStamped):
+        """Get velocity feedback (if available)"""
+        self.velocity[0] = msg.twist.linear.x
+        self.velocity[1] = msg.twist.linear.y
+        self.velocity[2] = msg.twist.linear.z
         
-        # Waypoint management
+        self.angular_velocity[0] = msg.twist.angular.x
+        self.angular_velocity[1] = msg.twist.angular.y
+        self.angular_velocity[2] = msg.twist.angular.z
+
+    def update_trajectory(self):
+        """Update current waypoint and desired trajectory"""
         if self.current_wp_idx >= len(self.trajectory):
             self.current_wp_idx = 0
-
-        desired_pos = np.array(self.trajectory[self.current_wp_idx])
         
-        # Check if we've reached the current waypoint
-        dist = np.linalg.norm(desired_pos - self.position)
+        current_target = self.trajectory[self.current_wp_idx]
+        self.desired_position = np.array(current_target)
+        
+        # Calculate distance to current waypoint
+        dist = np.linalg.norm(self.desired_position - self.position)
+        
         if dist < self.wp_threshold:
             self.current_wp_idx += 1
             if self.current_wp_idx >= len(self.trajectory):
                 self.current_wp_idx = 0
-            desired_pos = np.array(self.trajectory[self.current_wp_idx])
+        
+        # For simplicity, set desired velocity and acceleration to zero
+        # In practice, you would compute these from trajectory derivatives
+        self.desired_velocity = np.zeros(3)
+        self.desired_acceleration = np.zeros(3)
 
-        # Desired velocity and acceleration (for smoother tracking)
-        desired_vel = np.zeros(3)  # Could be computed from trajectory derivative
-        desired_acc = np.zeros(3)  # Could be computed from trajectory second derivative
+    def feedback_linearization_control(self):
+        """
+        Feedback linearization controller for quadcopter
+        """
+        # Update trajectory
+        self.update_trajectory()
         
-        # Feedback linearization control law
-        position_error = desired_pos - self.position
-        velocity_error = desired_vel - self.velocity
+        # Position errors
+        position_error = self.desired_position - self.position
+        velocity_error = self.desired_velocity - self.velocity
         
-        # Compute desired acceleration using feedback linearization
-        u = desired_acc + self.kp * position_error + self.kd * velocity_error
+        # Outer loop: Position control to desired acceleration
+        desired_acc = (self.desired_acceleration + 
+                      self.kp_pos * position_error + 
+                      self.kd_pos * velocity_error)
         
-        # Extract desired thrust and attitude commands
-        u_total = np.linalg.norm(u + np.array([0, 0, self.g]))
-        thrust = self.m * u_total
+        # Convert euler angles to radians for calculations
+        roll_rad = np.radians(self.euler_angles[0])
+        pitch_rad = np.radians(self.euler_angles[1])
+        yaw_rad = np.radians(self.euler_angles[2])
         
-        # Compute desired roll and pitch angles
-        if u_total > 0.1:  # Avoid division by zero
-            desired_roll_rad = np.arcsin(clamp(
-                (u[1] * np.cos(self.yaw_rad) - u[0] * np.sin(self.yaw_rad)) / u_total,
-                -0.3, 0.3))  # Limit to ±17 degrees
-            desired_pitch_rad = np.arcsin(clamp(
-                (u[0] * np.cos(self.yaw_rad) + u[1] * np.sin(self.yaw_rad)) / u_total,
-                -0.3, 0.3))  # Limit to ±17 degrees
+        # Rotation matrix from body to world frame
+        R = euler_to_rotation_matrix(self.euler_angles[0], 
+                                   self.euler_angles[1], 
+                                   self.euler_angles[2])
+        
+        # Desired total thrust (along z-axis in world frame)
+        desired_acc_world = desired_acc + np.array([0, 0, self.gravity])
+        
+        # Total thrust magnitude
+        thrust_magnitude = np.linalg.norm(desired_acc_world) * self.mass
+        
+        # Desired thrust direction (unit vector)
+        if thrust_magnitude > 0:
+            thrust_direction = desired_acc_world / np.linalg.norm(desired_acc_world)
         else:
-            desired_roll_rad = 0.0
-            desired_pitch_rad = 0.0
+            thrust_direction = np.array([0, 0, 1])
         
-        # Attitude control using PD controller
-        roll_error = desired_roll_rad - self.roll_rad
-        pitch_error = desired_pitch_rad - self.pitch_rad
+        # Desired attitude from thrust direction
+        # For small angles approximation:
+        desired_roll = np.arcsin(-thrust_direction[1])
+        desired_pitch = np.arcsin(thrust_direction[0] / np.cos(desired_roll))
+        desired_yaw = np.radians(self.euler_angles[2])  # Keep current yaw
         
-        # Angular velocities for attitude control
-        omega_roll = self.kp_att[0] * roll_error + self.kd_att[0] * (roll_error - self.last_error_roll) / dt
-        omega_pitch = self.kp_att[1] * pitch_error + self.kd_att[1] * (pitch_error - self.last_error_pitch) / dt
+        # Convert to degrees
+        desired_attitude = np.array([np.degrees(desired_roll), 
+                                   np.degrees(desired_pitch), 
+                                   np.degrees(desired_yaw)])
         
-        # Update last errors
-        self.last_error_roll = roll_error
-        self.last_error_pitch = pitch_error
+        # Attitude errors
+        attitude_error = desired_attitude - self.euler_angles
         
-        # Convert thrust to omega_z (assuming linear relationship)
-        base_thrust = self.m * self.g  # Hover thrust
-        omega_z = (thrust - base_thrust) * 0.5  # Scaling factor
+        # Wrap yaw error to [-180, 180]
+        attitude_error[2] = ((attitude_error[2] + 180) % 360) - 180
         
-        # Clamp control outputs
-        omega_roll = clamp(omega_roll, -50, 50)
-        omega_pitch = clamp(omega_pitch, -50, 50)
-        omega_z = clamp(omega_z, -100, 100)
+        # Desired angular velocities (set to zero for simplicity)
+        desired_angular_velocity = np.zeros(3)
+        angular_velocity_error = desired_angular_velocity - np.degrees(self.angular_velocity)
         
-        # Motor mixing
-        motor0 = clamp(636.0 - omega_roll - omega_pitch + omega_z, 400.0, 800.0)
-        motor1 = clamp(636.0 + omega_roll + omega_pitch + omega_z, 400.0, 800.0)
-        motor2 = clamp(636.0 + omega_roll - omega_pitch + omega_z, 400.0, 800.0)
-        motor3 = clamp(636.0 - omega_roll + omega_pitch + omega_z, 400.0, 800.0)
+        # Inner loop: Attitude control to desired angular acceleration
+        desired_angular_acc = (self.kp_att * attitude_error + 
+                             self.kd_att * angular_velocity_error)
+        
+        # Convert to torques using inertia matrix
+        I = np.diag([self.Ixx, self.Iyy, self.Izz])
+        desired_torques = I @ np.radians(desired_angular_acc)
+        
+        # Convert thrust and torques to motor commands
+        motor_speeds = self.allocation_matrix(thrust_magnitude, desired_torques)
+        
+        return motor_speeds
 
+    def allocation_matrix(self, thrust, torques):
+        """
+        Convert thrust and torques to motor speeds using allocation matrix
+        """
+        # Allocation matrix for X-configuration quadcopter
+        # motor layout: 
+        #   1     0
+        #     \ /
+        #      X
+        #     / \
+        #   2     3
+        
+        # Thrust contribution per motor
+        thrust_per_motor = thrust / 4.0
+        
+        # Torque distribution
+        tau_x = torques[0]  # Roll torque
+        tau_y = torques[1]  # Pitch torque
+        tau_z = torques[2]  # Yaw torque
+        
+        # Motor thrust commands (N)
+        T0 = thrust_per_motor - tau_x/(2*self.arm_length) - tau_y/(2*self.arm_length) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        T1 = thrust_per_motor + tau_x/(2*self.arm_length) + tau_y/(2*self.arm_length) - tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        T2 = thrust_per_motor + tau_x/(2*self.arm_length) - tau_y/(2*self.arm_length) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        T3 = thrust_per_motor - tau_x/(2*self.arm_length) + tau_y/(2*self.arm_length) + tau_z/(4*self.drag_coefficient/self.thrust_coefficient)
+        
+        # Convert thrust to motor speeds (rad/s)
+        # T = k_t * omega^2, so omega = sqrt(T/k_t)
+        motor_speeds = []
+        for T in [T0, T1, T2, T3]:
+            if T > 0:
+                omega = np.sqrt(T / self.thrust_coefficient)
+                motor_speeds.append(clamp(omega, 400.0, 800.0))
+            else:
+                motor_speeds.append(400.0)
+        
+        return motor_speeds
+
+    def control_loop(self):
+        """Main control loop"""
+        now = self.get_clock().now()
+        dt = (now - self.last_time).nanoseconds / 1e9
+        
+        if dt < 0.001:  # Skip if dt too small
+            return
+        
+        self.dt = dt
+        
+        # Apply feedback linearization control
+        motor_speeds = self.feedback_linearization_control()
+        
         # Publish motor commands
         cmd = Actuators()
         cmd.header = Header()
         cmd.header.stamp = now.to_msg()
-        cmd.velocity = [motor0, motor1, motor2, motor3]
+        cmd.velocity = motor_speeds
         self.publisher_.publish(cmd)
-
-        # Update time
+        
         self.last_time = now
-
+        
         # Logging
-        self.get_logger().info(f"Pos: [{self.position[0]:.2f}, {self.position[1]:.2f}, {self.position[2]:.2f}] m | "
-                             f"Desired: [{desired_pos[0]:.2f}, {desired_pos[1]:.2f}, {desired_pos[2]:.2f}] m | "
-                             f"Error: [{position_error[0]:.2f}, {position_error[1]:.2f}, {position_error[2]:.2f}] m | "
-                             f"Motors: [{motor0:.1f}, {motor1:.1f}, {motor2:.1f}, {motor3:.1f}] rad/s")
-
+        self.get_logger().info(f"Pos: [{self.position[0]:.2f}, {self.position[1]:.2f}, {self.position[2]:.2f}] | "
+                              f"Des: [{self.desired_position[0]:.2f}, {self.desired_position[1]:.2f}, {self.desired_position[2]:.2f}] | "
+                              f"Att: [{self.euler_angles[0]:.1f}, {self.euler_angles[1]:.1f}, {self.euler_angles[2]:.1f}] | "
+                              f"Motors: [{motor_speeds[0]:.0f}, {motor_speeds[1]:.0f}, {motor_speeds[2]:.0f}, {motor_speeds[3]:.0f}]")
+        
         # Publish reference position for plotting
         ref_msg = PointStamped()
         ref_msg.header.stamp = now.to_msg()
-        ref_msg.point.x = float(desired_pos[0])
-        ref_msg.point.y = float(desired_pos[1])
-        ref_msg.point.z = float(desired_pos[2])
+        ref_msg.point.x = self.desired_position[0]
+        ref_msg.point.y = self.desired_position[1]
+        ref_msg.point.z = self.desired_position[2]
         self.ref_pub.publish(ref_msg)
-
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PositionController()
+    node = FeedbackLinearizationController()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
