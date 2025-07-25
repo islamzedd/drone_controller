@@ -1,149 +1,169 @@
-# Feedback‐linearized hover controller: read poses[1] instead of poses[0]
-
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseArray
 from actuator_msgs.msg import Actuators
 from std_msgs.msg import Header
 import numpy as np
-from scipy.spatial.transform import Rotation as R
+import math
 
-def quaternion_to_euler_scipy(w, x, y, z):
-    r = R.from_quat([x, y, z, w])
-    return r.as_euler('xyz', degrees=False)
-
-class PositionController(Node):
+class FlHoverController(Node):
     def __init__(self):
-        super().__init__('FL_Position_Controller')
-        # SDF params
-        self.m, self.g = 1.5, 9.81
-        self.Ixx, self.Iyy, self.Izz = 0.0347563, 0.0458929, 0.0977
-        self.c_T, self.c_M, self.L = 8.54858e-06, 0.06, 0.244
-        self.max_rot_vel = 1100.0
+        super().__init__('fl_hover_controller')
+        # Vehicle parameters
+        self.m = 1.5
+        self.g = 9.81
+        self.I = np.diag([0.0347, 0.0459, 0.0977])
+        self.L = 0.244
+        self.c_T = 8.54858e-06
+        self.c_M = 0.06
+        self.max_omega = 1100.0
 
-        # hover setpoint
-        self.des_z = 2.0
+        # Desired setpoints
+        self.declare_parameters('', [
+            ('des_x', 2.0), ('des_y', 2.0), ('des_z', 2.0),
+            ('des_roll', 0.0), ('des_pitch', 0.0), ('des_yaw', 0.0)
+        ])
+        # Gains
+        self.declare_parameters('', [
+            ('kp_pos', 1.2), ('kd_pos', 1.5),
+            ('kp_att', 8.0), ('kd_att', 2.5)
+        ])
 
-        #try adding references for phi and theta to be zero
+        # Limits
+        self.declare_parameters('', [
+            ('max_acc', 2.0), ('max_ang_acc', 10.0), ('max_thrust_rate', 2.0)
+        ])
 
-        # PD gains
-        self.kp_z,   self.kd_z   = 2.0, 1.0
-        self.kp_phi, self.kd_phi = 8.0, 2.0
-        self.kp_theta, self.kd_theta = 8.0, 2.0
-        self.kp_psi, self.kd_psi = 4.0, 1.0
+        # State
+        self.prev_time = self.get_clock().now()
+        self.prev_pos = np.zeros(3)
+        self.prev_euler = np.zeros(3)
+        self.prev_u0 = self.m * self.g
 
-        # history for rate estimates
-        self.last_time = self.get_clock().now()
-        self.last_z = self.last_phi = self.last_theta = self.last_psi = None
+        # Sub/pub
+        self.create_subscription(PoseArray, '/world/quadcopter/pose/info', self.callback, 10)
+        self.pub = self.create_publisher(Actuators, '/X3/gazebo/command/motor_speed', 10)
 
-        # state
-        self.z = 0.0
-        self.error_z = 0.0
-        self.phi = self.theta = self.psi = 0.0
-
-        # subscriptions / pubs
-        self.create_subscription(
-            PoseArray,
-            '/world/quadcopter/pose/info',
-            self.pose_callback,
-            10
-        )
-        self.pub = self.create_publisher(
-            Actuators,
-            '/X3/gazebo/command/motor_speed',
-            10
-        )
-
-    def pose_callback(self, msg: PoseArray):
-        n = len(msg.poses)
-        if n < 2:
-            self.get_logger().warn(f"Expected ≥2 poses, got {n}")
+    def callback(self, msg: PoseArray):
+        if len(msg.poses) < 2:
             return
+        now = self.get_clock().now()
+        dt = (now - self.prev_time).nanoseconds * 1e-9
+        if dt < 1e-3:
+            return
+        dt = min(dt, 0.1)
 
-        # debug: print both entries to find which is nonzero
-        for i, p in enumerate(msg.poses):
-            self.get_logger().debug(f"Pose[{i}] z={p.position.z:.2f}")
-
-        # take the second entry (index 1)
+        # Read state
         p = msg.poses[1].position
         o = msg.poses[1].orientation
-        self.get_logger().info(f"Using Pose[1] z={p.z:.2f}")
+        x, y, z = p.x, p.y, p.z
+        roll, pitch, yaw = quaternion_to_euler((o.x, o.y, o.z, o.w))
 
-        now = self.get_clock().now()
-        dt = (now - self.last_time).nanoseconds / 1e9
-        if dt < 1e-4:
-            return
+        # Velocities and rates
+        vel = (np.array([x, y, z]) - self.prev_pos) / dt
+        rates = (np.array([roll, pitch, yaw]) - self.prev_euler) / dt
+        self.prev_pos = np.array([x, y, z])
+        self.prev_euler = np.array([roll, pitch, yaw])
 
-        # update state
-        self.z = p.z
-        self.phi, self.theta, self.psi = quaternion_to_euler_scipy(
-            o.w, o.x, o.y, o.z
-        )
+        # Desired
+        des_pos = np.array([
+            self.get_parameter('des_x').value,
+            self.get_parameter('des_y').value,
+            self.get_parameter('des_z').value
+        ])
+        des_att = np.array([
+            self.get_parameter('des_roll').value,
+            self.get_parameter('des_pitch').value,
+            self.get_parameter('des_yaw').value
+        ])
 
-        # estimate rates
-        if self.last_z is None:
-            zdot = phidot = thetadot = psidot = 0.0
-        else:
-            error_z_dot = (self.error_z - self.last_error_z) / dt
-            zdot     = (self.z     - self.last_z)     / dt
-            phidot   = (self.phi   - self.last_phi)   / dt
-            thetadot = (self.theta - self.last_theta) / dt
-            psidot   = (self.psi   - self.last_psi)   / dt
-        # virtual inputs
+        # Compute errors
+        e_pos = des_pos - np.array([x, y, z])
+        e_vel = -vel
+        e_att = des_att - np.array([roll, pitch, yaw])
+        e_rates = -rates
 
-        #Either control x,y with PID or set them to zero
+        # Print state and errors
+        self.get_logger().info(f"Pos: [{x:.2f}, {y:.2f}, {z:.2f}] Vel: [{vel[0]:.2f}, {vel[1]:.2f}, {vel[2]:.2f}]")
+        self.get_logger().info(f"Errors -> Pos: {e_pos}, Vel: {e_vel}, Att: {e_att}, Rates: {e_rates}")
 
-        #try changing the error to the derivative of the z, then for phi,theta and psi
-        error_z = (self.des_z - self.z)
-        v_z     =  self.kp_z*error_z   - self.kd_z* zdot
-        v_phi   = -self.kp_phi*self.phi             - self.kd_phi* phidot
-        v_theta = -self.kp_theta*self.theta         - self.kd_theta* thetadot
-        v_psi   =  self.kp_psi*(0.0 - self.psi)      - self.kd_psi* psidot
+        # Feedback linearization for translational dynamics
+        kp_pos = self.get_parameter('kp_pos').value
+        kd_pos = self.get_parameter('kd_pos').value
+        a_des = kp_pos * e_pos + kd_pos * e_vel
+        f = self.m * (a_des + np.array([0, 0, self.g]))
 
-        # feedback‐linearizing control law
-        u0 = self.m*(v_z + self.g)/(np.cos(self.phi)*np.cos(self.theta))
-        u0 = float(np.clip(u0, 0.5*self.m*self.g, 2.0*self.m*self.g))
-        u1 = -(self.Iyy - self.Izz)*thetadot*psidot + self.Ixx*v_phi
-        u2 = -(self.Izz - self.Ixx)*phidot*psidot   + self.Iyy*v_theta
-        u3 = -(self.Ixx - self.Iyy)*phidot*thetadot + self.Izz*v_psi
+        # Rotation matrix
+        cr = math.cos(roll); sr = math.sin(roll)
+        cp = math.cos(pitch); sp = math.sin(pitch)
+        cy = math.cos(yaw); sy = math.sin(yaw)
+        R = np.array([
+            [cp*cy, sr*sp*cy-cr*sy, cr*sp*cy+sr*sy],
+            [cp*sy, sr*sp*sy+cr*cy, cr*sp*sy-sr*cy],
+            [-sp,   sr*cp,           cr*cp]
+        ])
 
-        # map to individual thrusts
-        A = np.array([[1,1,1,1],
-                      [0,1,0,-1],
-                      [-1,0,1,0],
-                      [1,-1,1,-1]])
-        b = np.array([u0,
-                      u1/self.L,
-                      u2/self.L,
-                      u3*(self.c_T/self.c_M)])
-        T = np.linalg.solve(A, b)
+        # Thrust u0
+        u = R.T.dot(f)
+        u0 = np.clip(u[2], 0.5*self.m*self.g, 1.5*self.m*self.g)
+        drip = self.get_parameter('max_thrust_rate').value
+        u0 = np.clip(u0, self.prev_u0 - drip*dt, self.prev_u0 + drip*dt)
+        self.prev_u0 = u0
 
-        # rotor speeds
-        ω = np.sqrt(np.maximum(T,0)/self.c_T)
-        ω_cmd = np.clip(ω, 0.0, self.max_rot_vel)
+        # Feedback linearization for rotational dynamics
+        kp_att = self.get_parameter('kp_att').value
+        kd_att = self.get_parameter('kd_att').value
+        alpha_des = kp_att * e_att + kd_att * e_rates
+        omega_body = np.array([roll, pitch, yaw])
+        tau = self.I.dot(alpha_des) + np.cross(omega_body, self.I.dot(rates))
 
-        self.get_logger().info(f"v_z={v_z:.2f}, u0={u0:.2f}, ω={ω_cmd}")
+        # Print control targets
+        self.get_logger().info(f"Desired a: {a_des}, u0: {u0}, alpha_des: {alpha_des}, tau: {tau}")
 
+        # Mixer and motor speeds
+        b = np.hstack((u0, tau))
+        mix = np.array([
+            [1, 1, 1, 1],
+            [0, self.L, 0, -self.L],
+            [-self.L, 0, self.L, 0],
+            [self.c_M, -self.c_M, self.c_M, -self.c_M]
+        ])
+        thrusts = np.linalg.solve(mix, b)
+        omega = np.sqrt(np.clip(thrusts/self.c_T, 0, None))
+        omega = np.clip(omega, 0, self.max_omega)
+
+        # Print motor commands
+        self.get_logger().info(f"Motor omegas: {omega}")
+
+        # Publish
         cmd = Actuators()
         cmd.header = Header()
         cmd.header.stamp = now.to_msg()
-        cmd.velocity = ω_cmd.tolist()
+        cmd.velocity = omega.tolist()
         self.pub.publish(cmd)
+        self.prev_time = now
 
-        # store history
-        self.last_time  = now
-        self.last_z     = self.z
-        self.last_phi   = self.phi
-        self.last_theta = self.theta
-        self.last_psi   = self.psi
-        self.last_error_z = self.error_z
+
+def quaternion_to_euler(q):
+    x, y, z, w = q
+    t0 = 2.0 * (w*x + y*z)
+    t1 = 1.0 - 2.0*(x*x + y*y)
+    roll  = math.atan2(t0, t1)
+    t2 = 2.0*(w*y - z*x)
+    t2 = max(-1.0, min(1.0, t2))
+    pitch = math.asin(t2)
+    t3 = 2.0*(w*z + x*y)
+    t4 = 1.0 - 2.0*(y*y + z*z)
+    yaw   = math.atan2(t3, t4)
+    return roll, pitch, yaw
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PositionController()
+    node = FlHoverController()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
 
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
